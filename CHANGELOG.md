@@ -11,6 +11,17 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Added
 
+- `GLM53_MODEL_PRESET=dense-h3` with `ABLIT=1` (TP2): builds and serves a
+  second target variant whose `o_proj` on layers 15–44 stay native BF16, so
+  the runtime abliteration edit applies to them; layers 0–14 keep EXL3
+  `o_proj`. `tools/dense_overlay.py --keep-bf16 SUFFIX:LAYERS` leaves chosen
+  modules native. The variant has its own ref (`glm53-dense-h3-ablit`) and
+  pinned overlay SHA-256, shares the 6-bpw draft, and is never an ABLIT
+  fallback for the ordinary target. `tools/pack_profile.py` now accepts
+  `ABLIT=1` when `ABLIT_LAYERS` avoid every EXL3 `o_proj` of the pack (was:
+  always refused), and `start.sh` applies the same check pre-stop to manual
+  dense packs.
+
 - `GLM53_MODEL_PRESET=dense-h3` (TP2, opt-in): the first start builds the
   H3/6-bpw pair on the head from pinned public inputs and stages it in the HF
   cache: the TR3 target plus dense EXL3 tensors range-read from
@@ -160,6 +171,16 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   dry-capture when `CG_ESTIMATE=0` discards it anyway (KV profile 18 → 7 s);
   kill-first parallel stop and a 1 s `/health` poll. Receipts in
   `docs/cold-load-uma.md`.
+- `start-tp4.sh` forwards adaptive verification length (`GLM53_ADAPTIVE_K` and
+  its six companion knobs) to every rank and extends the DFlash capture-size list
+  the way `start.sh` has since 2026-09-08; the four-node launcher previously
+  ignored the knobs silently. TP4 now requires its own opt-in (caller or
+  `.env.tp4`), preserves caller setness for all seven knobs, validates enabled
+  settings before host actions, and reports the effective mode source.
+  Capture generation runs only on start/restart after validation; disabled mode
+  skips both the generator and rank patch. Space/equals capture overrides win.
+  CPU tests compare both launcher generators with runtime query lengths; TP4
+  cluster performance measurement remains separate.
 - Opt-in SM121 **thin-decode** kernels for the EXL3 routed experts
   (`GLM53_EXL3_MOE_FAST`, default `0`): `overlay/patch_exl3_decode_pipeline.py`
   adds two K4/N256 fast kernels (shared / independent gate-up input transform)
@@ -207,7 +228,7 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   supported for the tested geometry. CPU real-function metadata/composition
   checks are not GPU state/logit parity or TTFT measurements; GPU qualification
   remains outstanding. Reproduction uses the Dockerfile-pinned source probe
-  described in [README](README.md#reproduce-the-pinned-source-cpu-probe).
+  described in [the reference](docs/REFERENCE.md).
   The four-token Kpool replay floor remains conservative and kernel-unverified;
   coarse-only lookup can lose a whole page within three tokens of a boundary.
 - TP3/TP4 now preserve an explicitly exported `LOAD_FORMAT=` through shared and
@@ -226,6 +247,69 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Fixed
 
+- Fair-prefill scheduler integration (#283): `overlay/patch_scheduler_decode_floor.py`
+  moves to decode-floor **v7**, combining the three scheduler directions of
+  #246 (@beastllama), #221 (@surlebeat) and #180 (@krunkosaurus) in one patcher.
+  - A selected WAITING request that vLLM refuses KV allocation no longer stalls
+    a runnable prefill. It keeps being retried and recovers once
+    memory frees (#246).
+  - Explicit request priorities still rank fair-prefill candidates under
+    `--scheduling-policy priority`. FCFS is unchanged (#221).
+  - Installer migration follows #180's fail-closed contract. Pristine, v1, v2,
+    v5 and v5+priority (the #221 layout on `main` until now) installations
+    migrate to the same bytes as a fresh v7 install, and a re-apply is a
+    verified no-op. v3/v4 and unknown version markers, drifted, duplicated,
+    marker-only and unmarked helpers, and a duplicate policy wrapper are
+    refused without writing.
+  - `overlay/patch_mamba_align_chunking.py` accepts decode-floor v7 as well
+    as v5.
+  - #180's concurrency canary (`tests/check_concurrent_agents.py`) and its CPU
+    progress regressions (`tests/test_prefill_concurrency.py`) land with it.
+
+  Qualified live on a TP2 pair with a pre-registered baseline → candidate →
+  baseline run (installed scheduler `97c90a18…`, 2026-09-30):
+  - PASS: KV-blocked admission progress, the #180 contention canary (5/5 per
+    arm), TheGrill routine prefill, and the CPU migration matrix.
+  - Inconclusive, because the two baseline runs differ from each other by more
+    than the frozen tolerance: decode, concurrency and mixed TheGrill cells,
+    and temperature-0 output identity. No TheGrill gate regressed.
+  - Known limitation under `--scheduling-policy priority`: a short
+    high-priority prompt can wait about 85 s behind a larger KV-blocked
+    request of the same priority. This is tracked separately.
+  - `start-tp3.sh` and `start-tp4.sh` load the same two overlays, but only TP2
+    was qualified live.
+  - The proposed TP=2 `CHUNK=0` default is **not** part of this change;
+    launcher defaults are unchanged.
+
+- `start-tp4.sh` forwards `EXL3_FAT_GROUPED` to all four ranks (#286) and
+  defaults it to `1` (E3) with the coupled `EXL3_TEMP_ROWS_FUSED` default (32
+  with E3, 256 with E2), matching `start.sh` and `start-tp3.sh`. Before, the
+  value never reached a TP4 rank, so TP4 silently ran the E2 tier. Measured on
+  4 Sparks (1M ctx): cold prefill +35/+38/+41% at 8K/32K/100K, decode
+  unchanged. `EXL3_FAT_GROUPED=0` in `.env.tp4` restores E2.
+- `start-tp4.sh` honours `GLM53_DEFAULT_REASONING_EFFORT`, matching
+  `start.sh` and `start-tp3.sh`. TP=4 ignored it, so clients that sent no
+  `reasoning_effort` got the template's `max` fallback. The launcher now
+  declares it (empty default, so nothing changes until an operator sets
+  it), accepts only `low|high|max`, passes
+  `--default-chat-template-kwargs` on every rank, and forwards the value to
+  all four containers. `tests/test_default_reasoning_effort_tp4.sh` runs
+  the guard and each rank's argument construction; no TP=4 GPU boot was
+  run. On both `start-tp3.sh` and `start-tp4.sh`, a caller export
+  (`GLM53_DEFAULT_REASONING_EFFORT=low ./start-tp4.sh`) now wins over
+  `.env` and `.env.tpX`, setness-aware as on `start.sh`; before, the
+  `.env.example` line silently replaced it.
+- `start-tp3.sh` honours `GLM53_DEFAULT_REASONING_EFFORT`, a knob only
+  `start.sh` (TP=2) declared, guarded and forwarded. A TP3 seat ignored it
+  entirely, so a value set in the shared `.env` reached neither rank and
+  every client that sent no `reasoning_effort` fell through to
+  `files/chat_template.jinja`, which resolves an absent effort to `max`
+  rather than the intended `high`. The TP3 launcher now carries the
+  declaration (empty default, so no seat changes behaviour until an
+  operator opts in), the `low|high|max` guard, and
+  `--default-chat-template-kwargs` in both inner scripts, and the knob is
+  forwarded through the shared `serve_env` loop to worker ranks 1 and 2
+  and to the head's own `-e` list.
 - `start.sh` verifies every shard named by the selected snapshot's index and
   both sidecars against the worker's dereferenced file sizes before trusting
   the sync marker. Pinned, non-NFS `SKIP_SYNC=1` verifies the target snapshot
@@ -240,6 +324,17 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   The separate #280 instructions produced a 128-layer image that Docker
   overlay2 could build but could not instantiate on the target hosts;
   grouping removes five layers without changing the patch order.
+- Fold the `patch_dflash2_exl3` (#289) and indexer warmup-range (#203) COPY
+  and RUN steps into the existing dflash2/indexer layers. The five separate
+  instructions added since the kpool grouping produced a 126-layer image —
+  over overlay2's practical ~125-layer mount budget (moby/moby#46740) — so
+  `docker load` on the worker failed with `max depth exceeded` while the
+  head built and saved the same image fine; grouping removes five layers
+  without changing the patch order. (#301)
+- `tests/test_image_layer_budget.py` fails when the base image's 32 layers
+  plus the Dockerfile's COPY/RUN/ADD steps exceed 123, the largest depth
+  observed to load on a worker, so a PR that would repeat #301 fails on CPU
+  before merge instead of at the worker's `docker load`.
 
 - `overlay/patch_kpool_tail_seed_stride.py`: backport vLLM #57477 so the NVIDIA
   prefill kpool tail seed addresses the padded indexer stride. Pinned vLLM
@@ -299,6 +394,18 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   throughput and 1.18% higher cold long-C2 wall time. No universal decode
   speedup or VRAM reduction is claimed. Default remains off; see README
   for the full matrix, cache-residency limits and source-pinned receipt.
+
+### Fixed
+
+- `overlay/patch_scheduler_decode_floor.py` fair-prefill candidate ranking now
+  honors request `priority` when the server runs `--scheduling-policy
+  priority`: a lower numeric priority wins among eligible prefills, and the
+  existing service-age/round-robin ordering is preserved within a priority
+  tier. Under the default FCFS policy the ranking is byte-for-byte the
+  previous one. Service-time credit, chunk limits and running-decoder
+  protection are unchanged. Installed v5 helpers are migrated in place
+  (fail-closed: unknown or drifted anchors are rejected without a write) and
+  repeated application stays byte-identical.
 
 ## [1.6.0] — 2026-09-17
 
